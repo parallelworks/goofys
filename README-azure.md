@@ -10,7 +10,7 @@ $ $GOPATH/bin/goofys wasb://container:prefix <mountpoint> # if you only want to 
 ```
 
 Users can also configure credentials via `AZURE_STORAGE_ACCOUNT` and
-`AZURE_STORAGE_KEY` environment variables. See [Azure CLI configuration](https://docs.microsoft.com/en-us/cli/azure/azure-cli-configuration?view=azure-cli-latest#cli-configuration-values-and-environment-variables) for details. Goofys does not support `connection_string` or `sas_token` yet.
+`AZURE_STORAGE_KEY` environment variables. See [Azure CLI configuration](https://docs.microsoft.com/en-us/cli/azure/azure-cli-configuration?view=azure-cli-latest#cli-configuration-values-and-environment-variables) for details. Goofys also reads `sas_token` from the `[storage]` section (or the `AZURE_STORAGE_SAS_TOKEN` environment variable): when set and no account key is configured, goofys authenticates with the SAS token and re-reads the config file at each token renewal, so a rotated `sas_token` is picked up without remounting. `connection_string` is not supported.
 
 Goofys also accepts full `wasb` URIs:
 ```ShellSession

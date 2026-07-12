@@ -290,7 +290,11 @@ func AzureBlobConfig(endpoint string, location string, storageType string) (conf
 
 	account := os.Getenv("AZURE_STORAGE_ACCOUNT")
 	key := os.Getenv("AZURE_STORAGE_KEY")
+	sasToken := os.Getenv("AZURE_STORAGE_SAS_TOKEN")
 	configDir := os.Getenv("AZURE_CONFIG_DIR")
+	if configDir == "" {
+		configDir, _ = homedir.Expand("~/.azure")
+	}
 
 	// check if the url contains the storage endpoint
 	at := strings.Index(location, "@")
@@ -320,9 +324,6 @@ func AzureBlobConfig(endpoint string, location string, storageType string) (conf
 	}
 
 	if account == "" || key == "" {
-		if configDir == "" {
-			configDir, _ = homedir.Expand("~/.azure")
-		}
 		if config, err := ini.Load(configDir + "/config"); err == nil {
 			if sect, err := config.GetSection("storage"); err == nil {
 				if account == "" {
@@ -346,7 +347,14 @@ func AzureBlobConfig(endpoint string, location string, storageType string) (conf
 		return
 	}
 
-	if endpoint == "" || key == "" {
+	if sasToken == "" {
+		sasToken = readAzureSasToken(configDir)
+	}
+	// a SAS token replaces the account key, but an explicit key wins so
+	// existing key-based configs keep their behavior
+	useSasToken := key == "" && sasToken != ""
+
+	if !useSasToken && (endpoint == "" || key == "") {
 		var client azblob.AccountsClient
 		client, err = azureAccountsClient(account)
 		if err == nil {
@@ -410,6 +418,36 @@ func AzureBlobConfig(endpoint string, location string, storageType string) (conf
 	config.Endpoint = endpoint
 	config.AccountName = account
 	config.AccountKey = key
+	if useSasToken {
+		config.SasToken = azureConfigSasTokenProvider(configDir)
+	}
 
 	return
+}
+
+func readAzureSasToken(configDir string) string {
+	if cfg, err := ini.Load(configDir + "/config"); err == nil {
+		if sect, err := cfg.GetSection("storage"); err == nil {
+			if k, err := sect.GetKey("sas_token"); err == nil {
+				return k.Value()
+			}
+		}
+	}
+	return ""
+}
+
+// azureConfigSasTokenProvider re-reads the config file on every token renewal
+// so a rotated sas_token is picked up without remounting.
+func azureConfigSasTokenProvider(configDir string) SASTokenProvider {
+	return func() (string, error) {
+		token := readAzureSasToken(configDir)
+		if token == "" {
+			token = os.Getenv("AZURE_STORAGE_SAS_TOKEN")
+		}
+		if token == "" {
+			return "", fmt.Errorf("Missing sas_token: configure via "+
+				"AZURE_STORAGE_SAS_TOKEN or %v/config", configDir)
+		}
+		return strings.TrimPrefix(token, "?"), nil
+	}
 }
