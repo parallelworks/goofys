@@ -126,6 +126,60 @@ func TestAzureBlobConfigSasTokenFromEnv(t *testing.T) {
 	}
 }
 
+func TestAzureBlobConfigEnvSasTokenTakesPrecedenceOverFile(t *testing.T) {
+	dir := t.TempDir()
+	setAzureEnv(t, dir)
+	t.Setenv("AZURE_STORAGE_SAS_TOKEN", "se=2026-01-02T15:04:05Z&sig=env")
+	writeAzureConfig(t, dir, "[storage]\nsas_token = se=2026-01-02T15:04:05Z&sig=file\n")
+
+	config, err := AzureBlobConfig("", "container@testaccount.blob.core.windows.net", "blob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.SasToken == nil {
+		t.Fatal("SasToken provider not set")
+	}
+	token, err := config.SasToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "se=2026-01-02T15:04:05Z&sig=env" {
+		t.Errorf("token = %q, want the env token to win", token)
+	}
+}
+
+func TestAzureBlobConfigSasTokenIgnoredForDfs(t *testing.T) {
+	dir := t.TempDir()
+	setAzureEnv(t, dir)
+	writeAzureConfig(t, dir, "[storage]\nsas_token = se=2026-01-02T15:04:05Z&sig=abc\n")
+
+	config, err := AzureBlobConfig("", "container@testaccount.dfs.core.windows.net", "dfs")
+	if err == nil {
+		t.Error("expected the key-less dfs config to fail like before")
+	}
+	if config.SasToken != nil {
+		t.Error("SasToken provider set for dfs, but ADLv2 cannot sign with a SAS token")
+	}
+}
+
+func TestAzureBlobConfigSasTokenSurvivesInlineCommentChars(t *testing.T) {
+	dir := t.TempDir()
+	setAzureEnv(t, dir)
+	writeAzureConfig(t, dir, "[storage]\nsas_token = se=2026-01-02T15:04:05Z&sig=abc;d#ef\n")
+
+	config, err := AzureBlobConfig("", "container@testaccount.blob.core.windows.net", "blob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := config.SasToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "se=2026-01-02T15:04:05Z&sig=abc;d#ef" {
+		t.Errorf("token = %q, want ; and # preserved", token)
+	}
+}
+
 func TestSasTokenProviderErrorsWhenTokenRemoved(t *testing.T) {
 	dir := t.TempDir()
 	setAzureEnv(t, dir)
