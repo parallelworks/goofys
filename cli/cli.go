@@ -102,16 +102,6 @@ func kill(pid int, s os.Signal) (err error) {
 	return
 }
 
-// Mount the file system based on the supplied arguments, returning a
-// fuse.MountedFileSystem that can be joined to wait for unmounting.
-func mount(
-	ctx context.Context,
-	bucketName string,
-	flags *FlagStorage) (fs *Goofys, mfs *fuse.MountedFileSystem, err error) {
-
-	return goofys.Mount(ctx, bucketName, flags)
-}
-
 func massagePath() {
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, "PATH=") {
@@ -142,7 +132,10 @@ func massageArg0() {
 // binaries can embed goofys and dispatch to it; note it may daemonize by
 // re-executing os.Args[0] and can terminate the process on fatal errors.
 func Run(args []string, versionHash string) int {
-	VersionNumber = "0.25.0"
+	// release builds stamp internal.VersionNumber from the tag via ldflags
+	if VersionNumber == "" {
+		VersionNumber = "0.0.0-dev"
+	}
 	VersionHash = versionHash
 
 	massagePath()
@@ -213,7 +206,7 @@ func Run(args []string, versionHash string) int {
 		// Mount the file system.
 		var mfs *fuse.MountedFileSystem
 		var fs *Goofys
-		fs, mfs, err = mount(
+		fs, mfs, err = goofys.Mount(
 			context.Background(),
 			bucketName,
 			flags)
