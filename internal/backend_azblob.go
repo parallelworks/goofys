@@ -711,7 +711,7 @@ func (b *AZBlob) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 
 	src := c.NewBlobURL(param.Source)
 	dest := c.NewBlobURL(param.Destination)
-	resp, err := dest.StartCopyFromURL(context.TODO(), src.URL(), azblob.Metadata{}, azblob.ModifiedAccessConditions{}, azblob.BlobAccessConditions{}, azblob.AccessTierNone, azblob.BlobTagsMap{})
+	resp, err := dest.StartCopyFromURL(context.TODO(), src.URL(), azblob.Metadata{}, azblob.ModifiedAccessConditions{}, azblob.BlobAccessConditions{}, azblob.AccessTierNone, nil)
 	if err != nil {
 		return nil, mapAZBError(err)
 	}
@@ -805,7 +805,7 @@ func (b *AZBlob) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 		azblob.BlobHTTPHeaders{
 			ContentType: NilStr(param.ContentType),
 		},
-		nilMetadata(param.Metadata), azblob.BlobAccessConditions{}, azblob.AccessTierNone, azblob.BlobTagsMap{}, azblob.ClientProvidedKeyOptions{})
+		nilMetadata(param.Metadata), azblob.BlobAccessConditions{}, azblob.AccessTierNone, nil, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
 		return nil, mapAZBError(err)
 	}
@@ -872,7 +872,7 @@ func (b *AZBlob) MultipartBlobCommit(param *MultipartBlobCommitInput) (*Multipar
 
 	resp, err := blob.CommitBlockList(context.TODO(), parts,
 		azblob.BlobHTTPHeaders{}, nilMetadata(param.Metadata),
-		azblob.BlobAccessConditions{}, azblob.AccessTierNone, azblob.BlobTagsMap{}, azblob.ClientProvidedKeyOptions{})
+		azblob.BlobAccessConditions{}, azblob.AccessTierNone, nil, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
 		return nil, mapAZBError(err)
 	}
