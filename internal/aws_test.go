@@ -43,7 +43,7 @@ func (s *AwsTest) TestRegionDetection(t *C) {
 
 	err, isAws := s.s3.detectBucketLocationByHEAD()
 	t.Assert(err, IsNil)
-	t.Assert(*s.s3.awsConfig.Region, Equals, "eu-west-1")
+	t.Assert(s.s3.awsConfig.Region, Equals, "eu-west-1")
 	t.Assert(isAws, Equals, true)
 }
 

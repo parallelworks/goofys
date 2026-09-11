@@ -15,6 +15,7 @@
 package internal
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
@@ -26,10 +27,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/private/protocol/rest"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/encoding/httpbinding"
+	"github.com/aws/smithy-go/logging"
 )
 
 var (
@@ -65,9 +67,9 @@ type signer struct {
 	// Values that must be populated from the request
 	Request     *http.Request
 	Time        time.Time
-	Credentials *credentials.Credentials
-	Debug       aws.LogLevelType
-	Logger      aws.Logger
+	Credentials aws.Credentials
+	Debug       aws.ClientLogMode
+	Logger      logging.Logger
 	pathStyle   bool
 	bucket      string
 
@@ -76,35 +78,34 @@ type signer struct {
 	signature    string
 }
 
-// Sign requests with signature version 2.
-//
-// Will sign the requests with the service config's Credentials object
-// Signing is skipped if the credentials is the credentials.AnonymousCredentials
-// object.
-func SignV2(req *request.Request) {
-	// If the request does not need to be signed ignore the signing of the
-	// request if the AnonymousCredentials object is used.
-	if req.Config.Credentials == credentials.AnonymousCredentials {
-		return
-	}
-
+func SignV2(req *http.Request, credentials aws.Credentials, signingTime time.Time, pathStyle bool, bucket string) error {
 	v2 := signer{
-		Request:     req.HTTPRequest,
-		Time:        req.Time,
-		Credentials: req.Config.Credentials,
-		Debug:       req.Config.LogLevel.Value(),
-		Logger:      req.Config.Logger,
-		pathStyle:   aws.BoolValue(req.Config.S3ForcePathStyle),
+		Request:     req,
+		Time:        signingTime,
+		Credentials: credentials,
+		pathStyle:   pathStyle,
+		bucket:      bucket,
 	}
+	return v2.Sign()
+}
 
-	req.Error = v2.Sign()
+type v2HTTPsigner struct {
+	bucket    string
+	pathStyle bool
+}
+
+func (s v2HTTPsigner) SignHTTP(ctx context.Context, credentials aws.Credentials, req *http.Request, payloadHash, service, region string, signingTime time.Time, optFns ...func(*v4.SignerOptions)) error {
+	return SignV2(req, credentials, signingTime, s.pathStyle, s.bucket)
+}
+
+func V2Signer(bucket string) func(*s3.Options) {
+	return func(o *s3.Options) {
+		o.HTTPSignerV4 = v2HTTPsigner{bucket: bucket, pathStyle: o.UsePathStyle}
+	}
 }
 
 func (v2 *signer) Sign() error {
-	credValue, err := v2.Credentials.Get()
-	if err != nil {
-		return err
-	}
+	credValue := v2.Credentials
 
 	v2.Query = v2.Request.URL.Query()
 
@@ -131,10 +132,9 @@ func (v2 *signer) Sign() error {
 	} else {
 		uri = v2.Request.URL.Path
 	}
-	path := rest.EscapePath(uri, false)
-	if !v2.pathStyle {
-		host := strings.SplitN(v2.Request.URL.Host, ".", 2)[0]
-		path = "/" + host + uri
+	path := httpbinding.EscapePath(uri, false)
+	if !v2.pathStyle && strings.HasPrefix(v2.Request.URL.Host, v2.bucket+".") {
+		path = "/" + v2.bucket + path
 	}
 	if path == "" {
 		path = "/"
@@ -192,7 +192,7 @@ func (v2 *signer) Sign() error {
 	v2.Request.Header.Set("Authorization",
 		"AWS "+credValue.AccessKeyID+":"+v2.signature)
 
-	if v2.Debug.Matches(aws.LogDebugWithSigning) {
+	if v2.Debug.IsSigning() && v2.Logger != nil {
 		v2.logSigningInfo()
 	}
 
@@ -208,5 +208,5 @@ const logSignInfoMsg = `DEBUG: Request Signature:
 
 func (v2 *signer) logSigningInfo() {
 	msg := fmt.Sprintf(logSignInfoMsg, v2.stringToSign, v2.Request.Header.Get("Authorization"))
-	v2.Logger.Log(msg)
+	v2.Logger.Logf(logging.Debug, "%s", msg)
 }

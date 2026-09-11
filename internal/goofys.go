@@ -18,6 +18,7 @@ import (
 	. "github.com/kahing/goofys/api/common"
 
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/url"
@@ -28,7 +29,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -542,36 +544,26 @@ func mapAwsError(err error) error {
 		return nil
 	}
 
-	if awsErr, ok := err.(awserr.Error); ok {
-		switch awsErr.Code() {
-		case "BucketRegionError":
-			// don't need to log anything, we should detect region after
-			return err
+	var awsErr smithy.APIError
+	if errors.As(err, &awsErr) {
+		switch awsErr.ErrorCode() {
 		case "NoSuchBucket":
 			return syscall.ENXIO
 		case "BucketAlreadyOwnedByYou":
 			return fuse.EEXIST
 		}
-
-		if reqErr, ok := err.(awserr.RequestFailure); ok {
-			// A service error occurred
-			err = mapHttpError(reqErr.StatusCode())
-			if err != nil {
-				return err
-			} else {
-				s3Log.Errorf("http=%v %v s3=%v request=%v\n",
-					reqErr.StatusCode(), reqErr.Message(),
-					awsErr.Code(), reqErr.RequestID())
-				return reqErr
-			}
-		} else {
-			// Generic AWS Error with Code, Message, and original error (if any)
-			s3Log.Errorf("code=%v msg=%v, err=%v\n", awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
-			return awsErr
-		}
-	} else {
-		return err
 	}
+
+	var reqErr *smithyhttp.ResponseError
+	if errors.As(err, &reqErr) {
+		if mapped := mapHttpError(reqErr.HTTPStatusCode()); mapped != nil {
+			return mapped
+		}
+		s3Log.Errorf("http=%v err=%v", reqErr.HTTPStatusCode(), err)
+	} else if awsErr != nil {
+		s3Log.Errorf("code=%v msg=%v, err=%v", awsErr.ErrorCode(), awsErr.ErrorMessage(), err)
+	}
+	return err
 }
 
 func (fs *Goofys) allocateInodeId() (id fuseops.InodeID) {

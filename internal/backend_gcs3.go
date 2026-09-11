@@ -17,14 +17,20 @@ package internal
 import (
 	. "github.com/kahing/goofys/api/common"
 
+	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
 
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/jacobsa/fuse"
 )
@@ -32,6 +38,26 @@ import (
 // GCS variant of S3
 type GCS3 struct {
 	*S3Backend
+
+	resumableMu     sync.Mutex
+	resumableBase   *s3.Client
+	resumableStart  *s3.Client
+	resumableUpload *s3.Client
+}
+
+func (s *GCS3) resumableClients() (start, upload *s3.Client) {
+	s.resumableMu.Lock()
+	defer s.resumableMu.Unlock()
+	if s.resumableBase != s.Client {
+		options := s.Client.Options()
+		options.AuthSchemes = nil
+		s.resumableStart = s3.New(options, V2Signer(s.bucket))
+		options = s.Client.Options()
+		options.Credentials = aws.AnonymousCredentials{}
+		s.resumableUpload = s3.New(options)
+		s.resumableBase = s.Client
+	}
+	return s.resumableStart, s.resumableUpload
 }
 
 type GCS3MultipartBlobCommitInput struct {
@@ -81,39 +107,67 @@ func (s *GCS3) DeleteBlobs(param *DeleteBlobsInput) (*DeleteBlobsOutput, error) 
 	return &DeleteBlobsOutput{}, nil
 }
 
+func gcsRequest(update func(*smithyhttp.Request) error, response **http.Response, upload bool) func(*s3.Options) {
+	return func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			if err := stack.Finalize.Insert(middleware.FinalizeMiddlewareFunc("GCSResumableRequest", func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+				if err := update(in.Request.(*smithyhttp.Request)); err != nil {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, err
+				}
+				return next.HandleFinalize(ctx, in)
+			}), "Signing", middleware.Before); err != nil {
+				return err
+			}
+			return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("GCSResumableResponse", func(ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler) (middleware.DeserializeOutput, middleware.Metadata, error) {
+				out, metadata, err := next.HandleDeserialize(ctx, in)
+				if resp, ok := out.RawResponse.(*smithyhttp.Response); ok {
+					*response = resp.Response
+					if upload && resp.StatusCode == 308 {
+						out.Result = &s3.PutObjectOutput{ETag: aws.String(resp.Header.Get("ETag"))}
+						err = nil
+					} else if !upload && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+						out.Result = &s3.CreateMultipartUploadOutput{}
+						err = nil
+					}
+				}
+				return out, metadata, err
+			}), middleware.Before)
+		})
+	}
+}
+
 func (s *GCS3) MultipartBlobBegin(param *MultipartBlobBeginInput) (*MultipartBlobCommitInput, error) {
 	mpu := s3.CreateMultipartUploadInput{
 		Bucket:       &s.bucket,
 		Key:          &param.Key,
-		StorageClass: &s.config.StorageClass,
+		StorageClass: types.StorageClass(s.config.StorageClass),
 		ContentType:  param.ContentType,
 	}
 
 	if s.config.UseSSE {
-		mpu.ServerSideEncryption = &s.sseType
+		mpu.ServerSideEncryption = s.sseType
 		if s.config.UseKMS && s.config.KMSKeyID != "" {
 			mpu.SSEKMSKeyId = &s.config.KMSKeyID
 		}
 	}
 
 	if s.config.ACL != "" {
-		mpu.ACL = &s.config.ACL
+		mpu.ACL = types.ObjectCannedACL(s.config.ACL)
 	}
 
-	req, _ := s.CreateMultipartUploadRequest(&mpu)
-	// v4 signing of this fails
-	s.setV2Signer(&req.Handlers)
-	// get rid of ?uploads=
-	req.HTTPRequest.URL.RawQuery = ""
-	req.HTTPRequest.Header.Set("x-goog-resumable", "start")
-
-	err := req.Send()
+	var response *http.Response
+	client, _ := s.resumableClients()
+	_, err := client.CreateMultipartUpload(context.TODO(), &mpu, gcsRequest(func(req *smithyhttp.Request) error {
+		req.URL.RawQuery = ""
+		req.Header.Set("x-goog-resumable", "start")
+		return nil
+	}, &response, false))
 	if err != nil {
 		s3Log.Errorf("CreateMultipartUpload %v = %v", param.Key, err)
 		return nil, mapAwsError(err)
 	}
 
-	location := req.HTTPResponse.Header.Get("Location")
+	location := response.Header.Get("Location")
 	_, err = url.Parse(location)
 	if err != nil {
 		s3Log.Errorf("CreateMultipartUpload %v %v = %v", param.Key, location, err)
@@ -148,9 +202,10 @@ func (s *GCS3) uploadPart(param *MultipartBlobAddInput, totalSize uint64, last b
 
 	s3Log.Debug(params)
 
-	req, resp := s.PutObjectRequest(params)
-	req.Handlers.Sign.Clear()
-	req.HTTPRequest.URL, _ = url.Parse(*param.Commit.UploadId)
+	location, err := url.Parse(*param.Commit.UploadId)
+	if err != nil {
+		return nil, err
+	}
 
 	start := totalSize - param.Size
 	end := totalSize - 1
@@ -163,18 +218,16 @@ func (s *GCS3) uploadPart(param *MultipartBlobAddInput, totalSize uint64, last b
 
 	contentRange := fmt.Sprintf("bytes %v-%v/%v", start, end, size)
 
-	req.HTTPRequest.Header.Set("Content-Length", strconv.FormatUint(param.Size, 10))
-	req.HTTPRequest.Header.Set("Content-Range", contentRange)
-
-	err = req.Send()
+	params.ContentLength = aws.Int64(int64(param.Size))
+	var response *http.Response
+	_, client := s.resumableClients()
+	resp, err := client.PutObject(context.TODO(), params, gcsRequest(func(req *smithyhttp.Request) error {
+		req.URL = location
+		req.Header.Set("Content-Range", contentRange)
+		return nil
+	}, &response, true))
 	if err != nil {
-		// status indicating that we need more parts to finish this
-		if req.HTTPResponse.StatusCode == 308 {
-			err = nil
-		} else {
-			err = mapAwsError(err)
-			return
-		}
+		return nil, mapAwsError(err)
 	}
 
 	etag = resp.ETag
