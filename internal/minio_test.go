@@ -20,7 +20,7 @@ import (
 
 	"context"
 
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 type MinioTest struct {
@@ -47,14 +47,14 @@ func (s *MinioTest) SetUpSuite(t *C) {
 	s.s3, err = NewS3("", &s.flags, conf)
 	t.Assert(err, IsNil)
 
-	_, err = s.s3.ListBuckets(nil)
+	_, err = s.s3.ListBuckets(context.TODO(), nil)
 	t.Assert(err, IsNil)
 }
 
 func (s *MinioTest) SetUpTest(t *C) {
 	bucket := RandStringBytesMaskImprSrc(32)
 
-	_, err := s.s3.CreateBucket(&s3.CreateBucketInput{
+	_, err := s.s3.CreateBucket(context.TODO(), &s3.CreateBucketInput{
 		Bucket: &bucket,
 	})
 	t.Assert(err, IsNil)

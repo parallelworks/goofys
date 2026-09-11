@@ -126,7 +126,7 @@ Additionally, goofys also works with the following non-S3 object stores:
 # References
 
   * Data is stored on [Amazon S3](https://aws.amazon.com/s3/)
-  * [Amazon SDK for Go](https://github.com/aws/aws-sdk-go)
+  * [AWS SDK for Go v2](https://github.com/aws/aws-sdk-go-v2)
   * Other related fuse filesystems
     * [catfs](https://github.com/kahing/catfs): caching layer that can be used with goofys
     * [s3fs](https://github.com/s3fs-fuse/s3fs-fuse): another popular filesystem for S3

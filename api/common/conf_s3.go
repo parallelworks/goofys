@@ -15,16 +15,20 @@
 package common
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
 	"net/http"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go/logging"
 )
 
 type S3Config struct {
@@ -51,13 +55,11 @@ type S3Config struct {
 
 	Subdomain bool
 
-	Credentials *credentials.Credentials
-	Session     *session.Session
+	Credentials aws.CredentialsProvider
+	Session     *aws.Config
 
 	BucketOwner string
 }
-
-var s3Session *session.Session
 
 func (c *S3Config) Init() *S3Config {
 	if c.Region == "" {
@@ -70,56 +72,75 @@ func (c *S3Config) Init() *S3Config {
 }
 
 func (c *S3Config) ToAwsConfig(flags *FlagStorage) (*aws.Config, error) {
-	awsConfig := (&aws.Config{
-		Region: &c.Region,
-		Logger: GetLogger("s3"),
-	}).WithHTTPClient(&http.Client{
+	ctx := context.Background()
+	httpClient := &http.Client{
 		Transport: &defaultHTTPTransport,
 		Timeout:   flags.HTTPTimeout,
+	}
+	log := GetLogger("s3")
+	sdkLogger := logging.LoggerFunc(func(_ logging.Classification, format string, args ...interface{}) {
+		log.Debugf(format, args...)
 	})
+	var logMode aws.ClientLogMode
 	if flags.DebugS3 {
-		awsConfig.LogLevel = aws.LogLevel(aws.LogDebug | aws.LogDebugWithRequestErrors)
+		logMode = aws.LogRequest | aws.LogResponse | aws.LogRetries
 	}
-
-	if c.Credentials == nil {
-		if c.AccessKey != "" {
-			c.Credentials = credentials.NewStaticCredentials(c.AccessKey, c.SecretKey, "")
-		} else if c.Profile != "" {
-			c.Credentials = newSharedFileCredentials(c.Profile)
-		}
+	loadOptions := []func(*config.LoadOptions) error{
+		config.WithRegion(c.Region),
+		config.WithHTTPClient(httpClient),
+		config.WithLogger(sdkLogger),
+		config.WithClientLogMode(logMode),
 	}
-	if flags.Endpoint != "" {
-		awsConfig.Endpoint = &flags.Endpoint
+	if c.Credentials == nil && c.AccessKey != "" {
+		c.Credentials = credentials.NewStaticCredentialsProvider(c.AccessKey, c.SecretKey, "")
 	}
-
-	awsConfig.S3ForcePathStyle = aws.Bool(!c.Subdomain)
-
 	if c.Session == nil {
-		if s3Session == nil {
-			var err error
-			s3Session, err = session.NewSessionWithOptions(session.Options{
-				Profile:           c.Profile,
-				SharedConfigState: session.SharedConfigEnable,
-			})
-			if err != nil {
-				return nil, err
-			}
+		options := sharedConfigLoadOptions(c.Profile, loadOptions)
+		if c.Credentials != nil {
+			options = append(options, config.WithCredentialsProvider(c.Credentials))
 		}
-		c.Session = s3Session
+		loaded, err := config.LoadDefaultConfig(ctx, options...)
+		if err != nil {
+			return nil, err
+		}
+		if c.Credentials == nil {
+			loaded.Credentials = &sharedFileProvider{profile: c.Profile, loadOptions: loadOptions}
+		}
+		c.Session = &loaded
+	} else if c.Credentials == nil && c.Profile != "" {
+		c.Credentials = &sharedFileProvider{profile: c.Profile, loadOptions: loadOptions}
+	}
+
+	awsConfig := c.Session.Copy()
+	awsConfig.Region = c.Region
+	awsConfig.HTTPClient = httpClient
+	awsConfig.Logger = sdkLogger
+	awsConfig.ClientLogMode = logMode
+	if awsConfig.Retryer == nil {
+		awsConfig.Retryer = func() aws.Retryer {
+			return retry.NewStandard(func(options *retry.StandardOptions) {
+				options.MaxAttempts = 4
+				options.RateLimiter = ratelimit.None
+			})
+		}
+	}
+	if c.Credentials != nil {
+		awsConfig.Credentials = c.Credentials
 	}
 
 	if c.RoleArn != "" {
-		c.Credentials = stscreds.NewCredentials(stsConfigProvider{c}, c.RoleArn,
-			func(p *stscreds.AssumeRoleProvider) {
+		stsClient := sts.NewFromConfig(awsConfig, func(options *sts.Options) {
+			if c.StsEndpoint != "" {
+				options.BaseEndpoint = aws.String(c.StsEndpoint)
+			}
+		})
+		awsConfig.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsClient, c.RoleArn,
+			func(options *stscreds.AssumeRoleOptions) {
 				if c.RoleExternalId != "" {
-					p.ExternalID = &c.RoleExternalId
+					options.ExternalID = aws.String(c.RoleExternalId)
 				}
-				p.RoleSessionName = c.RoleSessionName
-			})
-	}
-
-	if c.Credentials != nil {
-		awsConfig.Credentials = c.Credentials
+				options.RoleSessionName = c.RoleSessionName
+			}))
 	}
 
 	if c.SseC != "" {
@@ -133,21 +154,5 @@ func (c *S3Config) ToAwsConfig(flags *FlagStorage) (*aws.Config, error) {
 		c.SseCDigest = base64.StdEncoding.EncodeToString(m[:])
 	}
 
-	return awsConfig, nil
-}
-
-type stsConfigProvider struct {
-	*S3Config
-}
-
-func (c stsConfigProvider) ClientConfig(serviceName string, cfgs ...*aws.Config) client.Config {
-	config := c.Session.ClientConfig(serviceName, cfgs...)
-	if c.Credentials != nil {
-		config.Config.Credentials = c.Credentials
-	}
-	if c.StsEndpoint != "" {
-		config.Endpoint = c.StsEndpoint
-	}
-
-	return config
+	return &awsConfig, nil
 }

@@ -15,13 +15,12 @@
 package common
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/aws/aws-sdk-go/aws/credentials"
 )
 
 func writeSharedCredentials(t *testing.T, path, profile, accessKey, secretKey, sessionToken string) {
@@ -41,6 +40,14 @@ func sharedCredentialsFile(t *testing.T) string {
 	t.Setenv("AWS_CONFIG_FILE", filepath.Join(dir, "config"))
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_DEFAULT_PROFILE", "")
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "")
+	t.Setenv("AWS_ROLE_ARN", "")
 	return path
 }
 
@@ -62,7 +69,7 @@ func TestSharedFileCredentialsRereadAfterExpire(t *testing.T) {
 		t.Fatal("newSharedFileCredentials() = nil, want credentials")
 	}
 
-	value, err := creds.Get()
+	value, err := creds.Retrieve(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +80,7 @@ func TestSharedFileCredentialsRereadAfterExpire(t *testing.T) {
 	writeSharedCredentials(t, path, "bucket", "AKIANEW", "secret-new", "token-new")
 	creds.Expire()
 
-	value, err = creds.Get()
+	value, err = creds.Retrieve(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,9 +94,9 @@ func TestSharedFileCredentialsRereadAfterRotation(t *testing.T) {
 	writeSharedCredentials(t, path, "bucket", "AKIAOLD", "secret-old", "token-old")
 
 	provider := &sharedFileProvider{profile: "bucket"}
-	creds := credentials.NewCredentials(provider)
+	creds := provider
 
-	value, err := creds.Get()
+	value, err := creds.Retrieve(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +107,7 @@ func TestSharedFileCredentialsRereadAfterRotation(t *testing.T) {
 	rotateSharedCredentials(t, path, "bucket", "AKIANEW", "secret-new", "token-new")
 	provider.checkedAt = time.Now().Add(-sharedCredentialsStatInterval)
 
-	value, err = creds.Get()
+	value, err = creds.Retrieve(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +121,7 @@ func TestSharedFileProviderIsExpired(t *testing.T) {
 	writeSharedCredentials(t, path, "bucket", "AKIAOLD", "secret-old", "token-old")
 
 	provider := &sharedFileProvider{profile: "bucket"}
-	if _, err := provider.Retrieve(); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -148,7 +155,7 @@ func TestSharedFileProviderIsExpiredIgnoresPreservedTimestamp(t *testing.T) {
 	}
 
 	provider := &sharedFileProvider{profile: "bucket"}
-	if _, err := provider.Retrieve(); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,7 +175,7 @@ func TestSharedFileProviderMissingFileKeepsCredentials(t *testing.T) {
 	writeSharedCredentials(t, path, "bucket", "AKIAOLD", "secret-old", "token-old")
 
 	provider := &sharedFileProvider{profile: "bucket"}
-	if _, err := provider.Retrieve(); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -187,18 +194,70 @@ func TestSharedFileProviderFailedReloadKeepsCredentials(t *testing.T) {
 	writeSharedCredentials(t, path, "bucket", "AKIAOLD", "secret-old", "token-old")
 
 	provider := &sharedFileProvider{profile: "bucket"}
-	if _, err := provider.Retrieve(); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
 	rotateSharedCredentials(t, path, "other", "AKIANEW", "secret-new", "token-new")
+	provider.checkedAt = time.Now().Add(-sharedCredentialsStatInterval)
 
-	value, err := provider.Retrieve()
+	value, err := provider.Retrieve(t.Context())
 	if err != nil {
 		t.Fatalf("Retrieve() = %v, want the previously loaded credentials", err)
 	}
 	if value.AccessKeyID != "AKIAOLD" {
 		t.Errorf("credentials after a failed reload = %+v, want the previously loaded profile", value)
+	}
+}
+
+func TestSharedFileProviderFailedReloadRecovers(t *testing.T) {
+	path := sharedCredentialsFile(t)
+	writeSharedCredentials(t, path, "bucket", "OLD", "old-secret", "old-token")
+	provider := newSharedFileCredentials("bucket")
+	if err := os.WriteFile(path, []byte("[invalid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	provider.checkedAt = time.Now().Add(-sharedCredentialsStatInterval)
+	value, err := provider.Retrieve(t.Context())
+	if err != nil || value.AccessKeyID != "OLD" {
+		t.Fatalf("failed reload must preserve old credentials: %v, %q", err, value.AccessKeyID)
+	}
+	rotateSharedCredentials(t, path, "bucket", "NEW", "new-secret", "new-token")
+	provider.checkedAt = time.Now().Add(-sharedCredentialsStatInterval)
+	value, err = provider.Retrieve(t.Context())
+	if err != nil || value.AccessKeyID != "NEW" {
+		t.Fatalf("provider did not recover after file became readable: %v, %q", err, value.AccessKeyID)
+	}
+}
+
+func TestSharedFileProviderRefreshesExpiredCredentials(t *testing.T) {
+	for _, profile := range []string{"", "bucket"} {
+		t.Run("profile="+profile, func(t *testing.T) {
+			path := sharedCredentialsFile(t)
+			fileProfile := profile
+			if fileProfile == "" {
+				fileProfile = "default"
+			}
+			writeSharedCredentials(t, path, fileProfile, "KEY", "secret", "token")
+			cfg, err := (&S3Config{Profile: profile}).Init().ToAwsConfig(&FlagStorage{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cfg.Credentials.Retrieve(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			provider := cfg.Credentials.(*sharedFileProvider)
+			provider.value.CanExpire = true
+			provider.value.Expires = time.Now().Add(-time.Minute)
+			provider.checkedAt = time.Now()
+			value, err := cfg.Credentials.Retrieve(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if value.Expired() || value.CanExpire {
+				t.Fatal("expired provider credentials were not refreshed within the stat interval")
+			}
+		})
 	}
 }
 
@@ -216,7 +275,7 @@ func TestNewSharedFileCredentialsResolvesConfigProfile(t *testing.T) {
 		t.Fatal("newSharedFileCredentials() = nil, want the profile resolved from the config file")
 	}
 
-	value, err := creds.Get()
+	value, err := creds.Retrieve(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +293,7 @@ func TestNewSharedFileCredentialsUnknownProfile(t *testing.T) {
 		t.Fatal("newSharedFileCredentials() = nil, want credentials that report the resolution error")
 	}
 
-	if _, err := creds.Get(); err == nil {
+	if _, err := creds.Retrieve(t.Context()); err == nil {
 		t.Error("a profile missing from the shared configuration must not resolve to another profile")
 	}
 }
@@ -242,10 +301,6 @@ func TestNewSharedFileCredentialsUnknownProfile(t *testing.T) {
 func TestToAwsConfigProfileCredentialsFollowRotation(t *testing.T) {
 	path := sharedCredentialsFile(t)
 	writeSharedCredentials(t, path, "bucket", "AKIAOLD", "secret-old", "token-old")
-
-	previousSession := s3Session
-	s3Session = nil
-	t.Cleanup(func() { s3Session = previousSession })
 
 	config := (&S3Config{Profile: "bucket"}).Init()
 	awsConfig, err := config.ToAwsConfig(&FlagStorage{})
@@ -256,7 +311,7 @@ func TestToAwsConfigProfileCredentialsFollowRotation(t *testing.T) {
 		t.Fatal("ToAwsConfig() left credentials unset for a profile mount")
 	}
 
-	value, err := awsConfig.Credentials.Get()
+	value, err := awsConfig.Credentials.Retrieve(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,13 +320,19 @@ func TestToAwsConfigProfileCredentialsFollowRotation(t *testing.T) {
 	}
 
 	writeSharedCredentials(t, path, "bucket", "AKIANEW", "secret-new", "token-new")
-	awsConfig.Credentials.Expire()
+	awsConfig.Credentials.(*sharedFileProvider).Expire()
 
-	value, err = awsConfig.Credentials.Get()
+	value, err = awsConfig.Credentials.Retrieve(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if value.AccessKeyID != "AKIANEW" || value.SessionToken != "token-new" {
 		t.Errorf("credentials after expiry = %+v, want the rotated profile", value)
 	}
+}
+
+func newSharedFileCredentials(profile string) *sharedFileProvider {
+	creds := &sharedFileProvider{profile: profile}
+	creds.Retrieve(context.Background())
+	return creds
 }

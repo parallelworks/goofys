@@ -15,13 +15,13 @@
 package common
 
 import (
+	"context"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/defaults"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 )
 
 const sharedCredentialsStatInterval = 10 * time.Second
@@ -38,45 +38,36 @@ func (s sharedFileState) equal(other sharedFileState) bool {
 }
 
 type sharedFileProvider struct {
-	mu         sync.Mutex
-	profile    string
-	resolved   *credentials.Credentials
-	value      credentials.Value
-	state      sharedFileState
-	loaded     bool
-	expired    bool
-	unreadable bool
-	checkedAt  time.Time
+	mu          sync.Mutex
+	profile     string
+	loadOptions []func(*config.LoadOptions) error
+	value       aws.Credentials
+	state       sharedFileState
+	loaded      bool
+	expired     bool
+	unreadable  bool
+	checkedAt   time.Time
 }
 
-func newSharedFileCredentials(profile string) *credentials.Credentials {
-	creds := credentials.NewCredentials(&sharedFileProvider{profile: profile})
-	if _, err := creds.Get(); err != nil {
-		credentialsLog.Warnf("cannot resolve credentials for profile %v: %v", profile, err)
-	}
-	return creds
-}
-
-func (p *sharedFileProvider) Retrieve() (credentials.Value, error) {
+func (p *sharedFileProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if !p.isExpired() {
+		return p.value, nil
+	}
 	state, stated := p.fileState()
 
-	sess, err := session.NewSessionWithOptions(session.Options{
-		Profile:           p.profile,
-		SharedConfigState: session.SharedConfigEnable,
-	})
+	cfg, err := config.LoadDefaultConfig(ctx, sharedConfigLoadOptions(p.profile, p.loadOptions)...)
 	if err != nil {
 		return p.keepLoaded(err)
 	}
 
-	value, err := sess.Config.Credentials.Get()
+	value, err := cfg.Credentials.Retrieve(ctx)
 	if err != nil {
 		return p.keepLoaded(err)
 	}
 
-	p.resolved = sess.Config.Credentials
 	p.value = value
 	p.loaded = true
 	p.expired = false
@@ -91,8 +82,22 @@ func (p *sharedFileProvider) Retrieve() (credentials.Value, error) {
 func (p *sharedFileProvider) IsExpired() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.isExpired()
+}
 
+func (p *sharedFileProvider) Expire() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expired = true
+}
+
+func (p *sharedFileProvider) isExpired() bool {
 	if !p.loaded || p.expired {
+		return true
+	}
+
+	if p.value.Expired() {
+		p.expired = true
 		return true
 	}
 
@@ -101,11 +106,6 @@ func (p *sharedFileProvider) IsExpired() bool {
 		return false
 	}
 	p.checkedAt = now
-
-	if p.resolved.IsExpired() {
-		p.expired = true
-		return true
-	}
 
 	state, stated := p.fileState()
 	if !stated {
@@ -122,9 +122,9 @@ func (p *sharedFileProvider) IsExpired() bool {
 	return p.expired
 }
 
-func (p *sharedFileProvider) keepLoaded(err error) (credentials.Value, error) {
+func (p *sharedFileProvider) keepLoaded(err error) (aws.Credentials, error) {
 	if !p.loaded {
-		return credentials.Value{}, err
+		return aws.Credentials{}, err
 	}
 
 	p.expired = false
@@ -132,6 +132,14 @@ func (p *sharedFileProvider) keepLoaded(err error) (credentials.Value, error) {
 	credentialsLog.Warnf("cannot reload credentials for profile %v, keeping the previous credentials: %v",
 		p.profile, err)
 	return p.value, nil
+}
+
+func sharedConfigLoadOptions(profile string, base []func(*config.LoadOptions) error) []func(*config.LoadOptions) error {
+	options := append([]func(*config.LoadOptions) error{}, base...)
+	if profile != "" {
+		options = append(options, config.WithSharedConfigProfile(profile))
+	}
+	return options
 }
 
 func (p *sharedFileProvider) fileState() (sharedFileState, bool) {
@@ -146,5 +154,5 @@ func sharedCredentialsFilename() string {
 	if filename := os.Getenv("AWS_SHARED_CREDENTIALS_FILE"); filename != "" {
 		return filename
 	}
-	return defaults.SharedCredentialsFilename()
+	return config.DefaultSharedCredentialsFilename()
 }
